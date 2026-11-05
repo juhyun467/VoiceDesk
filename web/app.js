@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 const S = Subtitles;
 const storageKey = 'voicedesk-project-v1';
-let cues = [], selected = null, mediaUrl = null, px = 60, cursor = 0, toastTimer, dirty = false;
+let cues = [], selected = null, mediaUrl = null, px = 60, cursor = 0, toastTimer, dirty = false, replayEnd = null;
 const video = $('video');
 const colors = [['#426fcb', '#ecf2ff'], ['#339480', '#e9f6f1'], ['#9a6cb2', '#f5edfa'], ['#c18240', '#fff4e6']];
 function toast(message) {
@@ -29,6 +29,7 @@ function choose(id, seek = true) {
   const cue = cues.find(c => c.id === id); if (seek && cue) setTime(cue.start);
 }
 function setTime(time) {
+  replayEnd = null;
   const max = Number.isFinite(video.duration) ? video.duration : total();
   cursor = Math.max(0, Math.min(time, max));
   if (mediaUrl && video.readyState >= 1) video.currentTime = cursor;
@@ -41,7 +42,7 @@ function renderPlayback() {
   $('duration').textContent = S.formatTime(Number.isFinite(video.duration) ? video.duration : total());
   $('playhead').style.left = `${110 + time * px}px`;
   const overlay = $('subtitle-overlay'); overlay.replaceChildren();
-  for (const cue of S.activeAt(ordered(), time)) overlay.append(el('div', 'subtitle-line', `${cue.speaker ? `[${cue.speaker}] ` : ''}${cue.text}`));
+  for (const cue of S.activeAt(ordered(), time)) overlay.append(el('div', 'subtitle-line', S.captionText(cue)));
   const activeIds = new Set(S.activeAt(cues, time).map(c => c.id));
   document.querySelectorAll('.cue').forEach(node => node.classList.toggle('playing', activeIds.has(node.dataset.id)));
 }
@@ -59,9 +60,10 @@ function renderList() {
     const button = el('button', `cue${cue.id === selected ? ' selected' : ''}`); button.type = 'button'; button.dataset.id = cue.id; button.setAttribute('role', 'listitem');
     button.append(el('span', 'cue-number', String(all.indexOf(cue) + 1).padStart(2, '0')));
     const content = el('div', 'cue-content'), meta = el('div', 'cue-meta');
-    const speaker = el('span', 'speaker-badge', cue.speaker || '화자 미지정'); paintSpeaker(speaker, cue.speaker); meta.append(speaker, el('span', '', `${S.formatTime(cue.start)} → ${S.formatTime(cue.end)}`));
-    if (isOverlap(cue)) meta.append(el('span', 'overlap-badge', '동시 발화'));
-    content.append(meta, el('div', 'cue-text', cue.text || '(내용을 입력하세요)')); button.append(content);
+    const speaker = el('span', 'speaker-badge', cue.speaker || '화자 미지정'); paintSpeaker(speaker, cue.speaker); meta.append(speaker, el('span', 'kind-badge', S.kindLabel(cue)), el('span', '', `${S.formatTime(cue.start)} → ${S.formatTime(cue.end)}`));
+    if (isOverlap(cue)) meta.append(el('span', 'overlap-badge', '겹친 구간'));
+    if (cue.reviewed) meta.append(el('span', 'reviewed-badge', '검수 ✓'));
+    content.append(meta, el('div', 'cue-text', cue.text ? S.captionText(cue) : '(내용을 입력하세요)')); button.append(content);
     button.onclick = () => choose(cue.id); list.append(button);
   }
   renderPlayback();
@@ -72,6 +74,7 @@ function fillForm() {
   $('edit-title').textContent = `자막 ${ordered().findIndex(c => c.id === selected) + 1} 수정`;
   $('start-time').value = S.formatTime(cue.start); $('end-time').value = S.formatTime(cue.end);
   $('speaker').value = cue.speaker; $('cue-text').value = cue.text;
+  $('cue-kind').value = S.kindOf(cue); $('cue-reviewed').checked = !!cue.reviewed; $('sound-preset').value = ''; updateKindHelp();
   $('speakers').replaceChildren(...[...new Set(cues.map(c => c.speaker).filter(Boolean))].map(speaker => { const option = el('option'); option.value = speaker; return option; }));
 }
 function renderTimeline() {
@@ -109,16 +112,27 @@ function renderTimeline() {
   $('overlap-count').textContent = cues.filter(isOverlap).length;
   renderPlayback();
 }
-function refresh() { renderList(); fillForm(); renderTimeline(); }
+function updateKindHelp() {
+  const speech = $('cue-kind').value === 'speech';
+  $('sound-preset').disabled = speech;
+  $('kind-help').textContent = speech ? '화자가 불분명하면 이름을 추측하지 마세요. 짧은 반응도 별도 발화로 남길 수 있습니다.' : '소리 설명만 입력하세요. 대괄호는 미리보기와 SRT에 자동으로 붙습니다. 소리의 주체를 알 때만 화자를 입력하세요.';
+}
+function refresh() {
+  renderList(); fillForm(); renderTimeline();
+  const summary = S.reviewSummary(cues);
+  $('review-summary').textContent = `미검수 ${summary.unreviewed}개 · 소리 자막 ${cues.filter(c => S.kindOf(c) !== 'speech').length}개`;
+  $('review-warning').textContent = cues.length ? `내용 미입력 ${summary.empty}개 · 3줄 이상 동시 표시 구간 ${summary.crowded}개. 대사와 소리는 삭제하지 말고 읽기 쉬운지 확인하세요.` : '자막을 추가하면 검수 상태와 동시 표시 줄 수를 확인할 수 있습니다.';
+}
 function commit() {
   const index = cues.findIndex(c => c.id === selected); if (index < 0) return true;
   try {
-    const updated = { ...cues[index], start: S.parseTime($('start-time').value), end: S.parseTime($('end-time').value), speaker: $('speaker').value.trim(), text: $('cue-text').value.trim() };
+    const updated = { ...cues[index], start: S.parseTime($('start-time').value), end: S.parseTime($('end-time').value), speaker: $('speaker').value.trim(), text: $('cue-text').value.trim(), kind: $('cue-kind').value, reviewed: $('cue-reviewed').checked };
+    if (updated.reviewed && !updated.text) throw Error('내용을 입력한 뒤 검수 완료로 표시하세요.');
     S.validate([updated]); cues[index] = updated; dirty = false; persist(); refresh(); return true;
   } catch (error) { toast(error.message); return false; }
 }
 function uid() { return globalThis.crypto?.randomUUID?.() || `cue-${Date.now()}-${Math.random().toString(36).slice(2)}`; }
-function addCue(overlap = false) {
+function addCue(overlap = false, kind = 'speech') {
   if (dirty && !commit()) return;
   const parent = cues.find(c => c.id === selected);
   let speaker = parent?.speaker || '화자 1';
@@ -129,13 +143,14 @@ function addCue(overlap = false) {
   }
   const start = overlap && parent ? parent.start : cursor;
   const end = overlap && parent ? parent.end : start + 2;
-  const cue = { id: uid(), start, end, speaker, text: '' };
+  const cue = { id: uid(), start, end, speaker: kind === 'speech' ? speaker : '', text: '', kind, reviewed: false };
   cues.push(cue); selected = cue.id; persist(); refresh(); $('cue-text').focus();
 }
 function download(name, content, type) {
   const url = URL.createObjectURL(new Blob([content], { type })); const link = el('a'); link.href = url; link.download = name; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 function togglePlay() {
+  replayEnd = null;
   if (!mediaUrl) { toast('먼저 영상 또는 음성을 선택하세요.'); return; }
   if (video.paused) video.play().catch(() => toast('이 파일을 재생할 수 없습니다. 브라우저가 지원하는 형식인지 확인하세요.'));
   else video.pause();
@@ -143,13 +158,18 @@ function togglePlay() {
 $('open-media').onclick = $('open-media-empty').onclick = () => $('media-input').click();
 $('media-input').onchange = event => {
   const file = event.target.files[0]; if (!file) return;
-  video.pause(); if (mediaUrl) URL.revokeObjectURL(mediaUrl);
+  replayEnd = null; video.pause(); if (mediaUrl) URL.revokeObjectURL(mediaUrl);
   mediaUrl = URL.createObjectURL(file); video.src = mediaUrl; video.load(); cursor = 0;
   $('media-name').textContent = file.name; $('empty-video').hidden = true;
   event.target.value = ''; renderPlayback();
 };
 video.addEventListener('loadedmetadata', () => { renderTimeline(); setTime(0); });
-video.addEventListener('timeupdate', renderPlayback);
+video.addEventListener('timeupdate', () => {
+  if (replayEnd !== null && video.currentTime >= replayEnd) {
+    const end = replayEnd; replayEnd = null; video.pause(); setTime(end);
+  }
+  renderPlayback();
+});
 video.addEventListener('play', () => { $('play').textContent = 'Ⅱ'; $('play').setAttribute('aria-label', '일시정지'); });
 video.addEventListener('pause', () => { $('play').textContent = '▶'; $('play').setAttribute('aria-label', '재생'); });
 video.addEventListener('error', () => { $('empty-video').hidden = false; toast('미디어를 재생할 수 없습니다. MP4(H.264) 또는 WAV 등 지원 형식을 사용하세요.'); });
@@ -157,9 +177,32 @@ $('play').onclick = togglePlay; $('back').onclick = () => setTime(cursor - 3); $
 $('speed').onchange = () => { video.playbackRate = +$('speed').value; };
 $('search').oninput = renderList; $('overlap-only').onchange = renderList;
 $('apply-edit').onclick = commit;
-for (const id of ['start-time', 'end-time', 'speaker', 'cue-text']) $(id).oninput = () => { dirty = true; $('save-state').textContent = '수정 중 · 수정 적용을 눌러 저장'; };
-$('set-start').onclick = () => { $('start-time').value = S.formatTime(cursor); dirty = true; };
-$('set-end').onclick = () => { $('end-time').value = S.formatTime(cursor); dirty = true; };
+function markDirty(resetReview = true) {
+  dirty = true;
+  if (resetReview) $('cue-reviewed').checked = false;
+  $('save-state').textContent = '수정 중 · 수정 적용을 눌러 저장';
+}
+for (const id of ['start-time', 'end-time', 'speaker', 'cue-text']) $(id).oninput = () => markDirty();
+$('cue-kind').onchange = () => { markDirty(); updateKindHelp(); };
+$('cue-reviewed').onchange = () => markDirty(false);
+$('sound-preset').onchange = () => {
+  const preset = $('sound-preset').value;
+  if (!preset) return;
+  $('cue-text').value = preset;
+  $('cue-kind').value = /웃음|한숨/.test(preset) ? 'laughter' : /음악/.test(preset) ? 'music' : 'sound';
+  markDirty(); updateKindHelp();
+};
+$('replay-cue').onclick = () => {
+  if (dirty && !commit()) return;
+  const cue = cues.find(c => c.id === selected);
+  if (!mediaUrl || !cue) { toast('먼저 영상 또는 음성을 선택하세요.'); return; }
+  if (!Number.isFinite(video.duration) || cue.start >= video.duration) { toast('선택 구간이 미디어 길이를 벗어나거나 아직 불러오는 중입니다.'); return; }
+  setTime(cue.start); replayEnd = Math.min(cue.end, video.duration);
+  video.play().catch(() => { replayEnd = null; toast('선택 구간을 재생하지 못했습니다.'); });
+};
+$('set-start').onclick = () => { $('start-time').value = S.formatTime(cursor); markDirty(); };
+$('set-end').onclick = () => { $('end-time').value = S.formatTime(cursor); markDirty(); };
+$('add-sound').onclick = () => addCue(false, 'sound');
 $('add-cue').onclick = () => addCue(); $('add-overlap').onclick = () => addCue(true);
 $('delete-cue').onclick = () => {
   if (!confirm('선택한 자막을 삭제할까요?')) return;
@@ -167,7 +210,10 @@ $('delete-cue').onclick = () => {
 };
 $('export').onclick = () => {
   if (dirty && !commit()) return;
-  try { if (!cues.length) throw Error('저장할 자막을 먼저 추가하세요.'); download('subtitles.srt', '\uFEFF' + S.toSrt(ordered()), 'application/x-subrip;charset=utf-8'); toast('SRT를 저장했습니다. 겹치는 발화는 여러 줄로 표시됩니다.'); }
+  try { if (!cues.length) throw Error('저장할 자막을 먼저 추가하세요.');
+    const summary = S.reviewSummary(cues);
+    if ((summary.unreviewed || summary.crowded) && !confirm(`미검수 자막 ${summary.unreviewed}개, 3줄 이상 동시 표시 구간 ${summary.crowded}개가 있습니다. 검수 전 초안으로 SRT를 저장할까요?`)) return;
+    download('subtitles.srt', '\uFEFF' + S.toSrt(ordered()), 'application/x-subrip;charset=utf-8'); toast('SRT를 저장했습니다. 겹치는 발화는 여러 줄로 표시됩니다.'); }
   catch (error) { toast(error.message); }
 };
 $('save-project').onclick = () => { if (dirty && !commit()) return; download('voicedesk-project.json', JSON.stringify({ version: 1, cues }, null, 2), 'application/json'); toast('프로젝트를 저장했습니다. 영상 파일은 포함되지 않습니다.'); };
@@ -188,7 +234,7 @@ $('subtitle-input').onchange = async event => {
 };
 $('new-project').onclick = () => {
   if ((cues.length || dirty) && !confirm('새 프로젝트를 시작할까요? 현재 자막과 미적용 수정은 지워집니다.')) return;
-  video.pause(); video.removeAttribute('src'); video.load(); if (mediaUrl) URL.revokeObjectURL(mediaUrl); mediaUrl = null;
+  replayEnd = null; video.pause(); video.removeAttribute('src'); video.load(); if (mediaUrl) URL.revokeObjectURL(mediaUrl); mediaUrl = null;
   $('empty-video').hidden = false; $('media-name').textContent = '미디어 미선택';
   cues = []; selected = null; dirty = false; cursor = 0; persist(); refresh();
 };
@@ -201,6 +247,9 @@ $('load-demo').onclick = () => {
     { id: uid(), start: 2.4, end: 3.2, speaker: '화자 2', text: '네, 맞아요.' },
     { id: uid(), start: 4.3, end: 7.4, speaker: '화자 2', text: '동시에 말해도 두 사람의 말을 모두 보여주면 좋겠어요.' },
     { id: uid(), start: 6.0, end: 7.8, speaker: '화자 1', text: '짧은 대답도 빠지지 않게요.' },
+    { id: uid(), start: 7.0, end: 8.0, speaker: '화자 2', text: '웃음', kind: 'laughter' },
+    { id: uid(), start: 8.1, end: 8.5, speaker: '', text: '문 닫히는 소리', kind: 'sound' },
+    { id: uid(), start: 8.5, end: 12, speaker: '', text: '잔잔한 음악', kind: 'music' },
     { id: uid(), start: 8.5, end: 10.8, speaker: '화자 1', text: '각 화자의 시간을 따로 수정할 수 있어요.' }
   ];
   selected = cues[0].id; dirty = false; persist(); refresh(); setTime(2.5); toast('편집용 가상 대사입니다. 연결된 예제 영상은 없습니다.');
