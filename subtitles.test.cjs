@@ -31,3 +31,18 @@ test('SRT roundtrip preserves active dialogue at every speech boundary',()=>{
  const imported=S.fromSrt(S.toSrt(cues));
  for(const time of [0,1,2,2.5,3,4,5,5.5,6]) assert.deepEqual(S.activeAt(imported,time).map(c=>c.text).sort(),S.activeAt(cues,time).map(c=>c.text).sort());
 });
+test('speech, laughter, effect and music are formatted together without dropping overlap',()=>{
+ const cues=[cue('a',1,3,'민수','괜찮아요?'),{...cue('b',2,4,'지연','웃음'),kind:'laughter'}, {...cue('c',2,2.8,'','문 닫히는 소리'),kind:'sound'}, {...cue('d',3,5,'','[잔잔한 음악]'),kind:'music'}];
+ assert.equal(S.captionText(cues[1]),'[지연] [웃음]');
+ assert.equal(S.captionText(cues[3]),'[잔잔한 음악]');
+ const imported=S.fromSrt(S.toSrt(cues));
+ for(const time of [1,2,2.5,2.8,3,4,4.5,5]) assert.deepEqual(S.activeAt(imported,time).map(S.captionText).sort(),S.activeAt(cues,time).map(S.captionText).sort());
+ assert.equal(imported.find(c=>c.text==='웃음').kind,'laughter');
+ assert.equal(imported.find(c=>c.text==='잔잔한 음악').kind,'music');
+});
+test('review checks count missing content, unreviewed cues and crowded display intervals',()=>{
+ const cues=[{...cue('a',0,2,'A','a'),reviewed:true},cue('b',0,2,'B','b'),{...cue('c',0,2,'',''),kind:'sound'}];
+ assert.deepEqual(S.reviewSummary(cues),{unreviewed:2,empty:1,crowded:1});
+ assert.throws(()=>S.validate([{...cues[0],kind:'unknown'}]));
+ assert.throws(()=>S.validate([{...cues[0],reviewed:'true'}]));
+});
