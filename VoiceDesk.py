@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import re
 import threading
 import mimetypes
 import tkinter as tk
@@ -22,6 +23,48 @@ class RowItem:
         self.speaker = speaker
         self.original = original
         self.korean = korean
+
+
+def parse_timestamp(value):
+    """Read MM:SS[.mmm] or HH:MM:SS[,mmm] as milliseconds."""
+    match = re.fullmatch(r"(?:(\d+):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?", value.strip())
+    if not match:
+        raise ValueError(f"잘못된 자막 시간: {value}")
+    hours, minutes, seconds, fraction = match.groups()
+    if int(seconds) >= 60 or (hours is not None and int(minutes) >= 60):
+        raise ValueError(f"잘못된 자막 시간: {value}")
+    return ((int(hours or 0) * 60 + int(minutes)) * 60 + int(seconds)) * 1000 + int((fraction or '0').ljust(3, '0'))
+
+
+def srt_timestamp(milliseconds):
+    seconds, millis = divmod(milliseconds, 1000)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:02}:{minutes:02}:{seconds:02},{millis:03}"
+
+
+def render_srt(rows):
+    """Split at speech boundaries so simultaneous speakers share one cue."""
+    segments = []
+    for row in rows:
+        parts = re.split(r"\s*(?:-->|[-–~])\s*", row.time.strip())
+        if len(parts) != 2:
+            raise ValueError(f"시간 범위를 확인해 주세요: {row.time}")
+        start, end = map(parse_timestamp, parts)
+        if end <= start:
+            raise ValueError(f"종료 시간은 시작 시간보다 늦어야 합니다: {row.time}")
+        text = ' '.join((row.korean.strip() or row.original.strip()).split())
+        if not text:
+            raise ValueError(f"자막 내용이 없습니다: {row.time}")
+        speaker = ' '.join(row.speaker.split())
+        segments.append((start, end, f"[{speaker}] {text}" if speaker else text))
+    boundaries = sorted({time for start, end, _ in segments for time in (start, end)})
+    cues = []
+    for start, end in zip(boundaries, boundaries[1:]):
+        lines = [text for begin, finish, text in segments if begin <= start and finish >= end]
+        if lines:
+            cues.append(f"{len(cues) + 1}\n{srt_timestamp(start)} --> {srt_timestamp(end)}\n" + '\n'.join(lines) + '\n\n')
+    return ''.join(cues)
 
 
 class App(tk.Tk):
@@ -113,7 +156,7 @@ class App(tk.Tk):
             command=self.start_transcription,
         ).pack(side="left")
         ttk.Button(toolbar, text="+ 대사 직접 추가", command=self.add_row).pack(side="left", padx=5)
-        ttk.Button(toolbar, text="내보내기 (TXT/CSV)", command=self.export).pack(side="right")
+        ttk.Button(toolbar, text="자막 저장 (SRT)", command=self.export).pack(side="right")
 
         self.status = tk.StringVar(value="준비됨")
         tk.Label(
@@ -172,7 +215,7 @@ class App(tk.Tk):
         self.status.set("초기화됨")
 
     def add_row(self):
-        item = RowItem("-", "00:00 - 00:00", "화자 1", "직접 입력 원문", "직접 입력 번역")
+        item = RowItem("-", "00:00.000 - 00:02.000", "화자 1", "직접 입력 원문", "직접 입력 번역")
         self.rows.append(item)
         idx = len(self.rows)
         self.tree.insert(
@@ -224,12 +267,14 @@ class App(tk.Tk):
                 제공된 음성 파일을 분석하여 다음 JSON 포맷 배열로만 응답해 주세요:
                 [
                   {
-                    "time": "시작초-종료초 (예: 00:01 - 00:05)",
+                    "time": "HH:MM:SS.mmm - HH:MM:SS.mmm (예: 00:00:01.200 - 00:00:05.450)",
                     "speaker": "화자 1 (또는 식별된 이름)",
                     "original": "음성 원문 텍스트",
                     "korean": "자연스러운 한국어 번역문 (원문이 이미 한국어라면 정돈된 원문)"
                   }
                 ]
+                각 발화의 실제 시작 및 종료 시각을 기록하세요. 동시에 말하는 화자는 각각 별도 항목으로 기록하고 시간을 겹친 채 유지하세요.
+                짧은 대답이나 추임새도 누락하지 마세요. 들리지 않는 내용을 추측해서 만들지 마세요.
                 다른 설명 없이 순수 JSON 리스트만 출력하세요. 마크다운 ```json 태그도 제외하고 순수 JSON만 출력하세요.
                 """
 
@@ -308,24 +353,32 @@ class App(tk.Tk):
             self.batch_running = False
 
     def export(self):
+        if self.batch_running:
+            messagebox.showwarning("처리 중", "전사가 끝난 뒤 저장해 주세요.")
+            return
         if not self.rows:
             messagebox.showwarning("대사 없음", "내보낼 데이터가 없습니다.")
             return
 
-        save_path = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("CSV 파일", "*.csv"), ("텍스트 파일", "*.txt")],
-        )
-        if save_path:
-            with open(save_path, "w", encoding="utf-8-sig") as f:
-                f.write("번호,파일명,시간,화자,원문,한국어 번역\n")
-                for i, r in enumerate(self.rows, 1):
-                    clean_orig = r.original.replace('"', '""')
-                    clean_kor = r.korean.replace('"', '""')
-                    f.write(
-                        f'{i},"{r.filename}","{r.time}","{r.speaker}","{clean_orig}","{clean_kor}"\n'
-                    )
-            messagebox.showinfo("저장 완료", "성공적으로 저장되었습니다!")
+        groups = {}
+        for row in self.rows:
+            groups.setdefault(row.filename, []).append(row)
+        try:
+            # Validate everything before opening or overwriting an output file.
+            outputs = [(name, render_srt(rows)) for name, rows in groups.items()]
+            for name, content in outputs:
+                save_path = filedialog.asksaveasfilename(
+                    title=f"SRT 저장: {name}",
+                    initialfile=f"{Path(name).stem if name != '-' else 'subtitles'}.srt",
+                    defaultextension=".srt",
+                    filetypes=[("SRT 자막", "*.srt")],
+                )
+                if not save_path:
+                    return
+                Path(save_path).write_text(content, encoding="utf-8-sig")
+            messagebox.showinfo("저장 완료", "SRT 자막을 저장했습니다.")
+        except (ValueError, OSError) as error:
+            messagebox.showerror("저장 오류", str(error))
 
 
 if __name__ == "__main__":
